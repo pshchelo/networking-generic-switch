@@ -24,7 +24,7 @@ from tempest_plugin.tests.common import ovs_lib
 CONF = config.CONF
 
 
-class NGSBasicOps(net_base.BaseAdminNetworkTest):
+class NGSBasicOpsBase(net_base.BaseAdminNetworkTest):
 
     """This smoke test tests the ovs_linux driver.
 
@@ -41,7 +41,7 @@ class NGSBasicOps(net_base.BaseAdminNetworkTest):
     """
     @classmethod
     def skip_checks(cls):
-        super(NGSBasicOps, cls).skip_checks()
+        super(NGSBasicOpsBase, cls).skip_checks()
         if not CONF.service_available.ngs:
             raise cls.skipException('Networking Generic Switch is required.')
 
@@ -97,26 +97,7 @@ class NGSBasicOps(net_base.BaseAdminNetworkTest):
             tag = None
         return tag
 
-    @decorators.idempotent_id('59cb81a5-3fd5-4ad3-8c4a-c0b27435cb9c')
-    @test.services('network')
-    def test_ngs_basic_ops(self):
-        port = self.create_neutron_port()
-        net_tag = self.admin_networks_client.list_networks(
-            name=CONF.ngs.network_name
-            )['networks'][0]['provider:segmentation_id']
-        ovs_tag = self.ovs_get_tag()
-        self.assertEqual(net_tag, ovs_tag)
-
-        # Ensure that tag is removed when port is deleted
-        self.admin_ports_client.delete_port(port['id'])
-        ovs_tag = self.ovs_get_tag()
-        self.assertIsNone(ovs_tag)
-
-    @decorators.idempotent_id('282a513d-cc01-486c-aa12-1c45f7b6e5a8')
-    @test.services('network')
-    def test_ngs_basic_ops_switch_id(self):
-        llc = [{'switch_id': self.get_local_port_mac(CONF.ngs.bridge_name),
-                'port_id': CONF.ngs.port_name}]
+    def _test_ngs_basic_ops(self, llc=None):
         port = self.create_neutron_port(llc=llc)
         net_tag = self.admin_networks_client.list_networks(
             name=CONF.ngs.network_name
@@ -128,3 +109,17 @@ class NGSBasicOps(net_base.BaseAdminNetworkTest):
         self.admin_ports_client.delete_port(port['id'])
         ovs_tag = self.ovs_get_tag()
         self.assertIsNone(ovs_tag)
+
+
+class NGSBasicOps(NGSBasicOpsBase):
+    @decorators.idempotent_id('59cb81a5-3fd5-4ad3-8c4a-c0b27435cb9c')
+    @test.services('network')
+    def test_ngs_basic_ops(self):
+        self._test_ngs_basic_ops()
+
+    @decorators.idempotent_id('282a513d-cc01-486c-aa12-1c45f7b6e5a8')
+    @test.services('network')
+    def test_ngs_basic_ops_switch_id(self):
+        llc = [{'switch_id': self.get_local_port_mac(CONF.ngs.bridge_name),
+                'port_id': CONF.ngs.port_name}]
+        self._test_ngs_basic_ops(llc=llc)
