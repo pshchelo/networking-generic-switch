@@ -12,15 +12,97 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import itertools
+import random
+import time
 import uuid
 
 import netmiko
+from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import timeutils
+from tooz import coordination
 
 from networking_generic_switch import devices
 from networking_generic_switch import exceptions as exc
 
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
+
+DLM_COORDINATOR = None
+
+
+def get_coordinator():
+    global DLM_COORDINATOR
+    if not DLM_COORDINATOR and CONF.ngs_coordination.backend_url:
+        DLM_COORDINATOR = coordination.get_coordinator(
+            CONF.ngs_coordination.backend_url,
+            ('ngs-' + CONF.host).encode('ascii'))
+        DLM_COORDINATOR.start()
+    return DLM_COORDINATOR
+
+
+def _reset_coordinator():
+    global DLM_COORDINATOR
+    if DLM_COORDINATOR:
+        DLM_COORDINATOR.stop()
+    DLM_COORDINATOR = None
+
+
+class NetmikoLock(object):
+    """Netmiko-specific tooz lock wrapper
+
+    If coordination backend is configured, it will attempt to grab any lock
+    from a predefined set of names, with the set length as configured value.
+
+    """
+
+    def __init__(self, coordinator, locks_pool_size=1, locks_prefix='ngs-',
+                 timeout=None):
+        self.coordinator = coordinator
+        self.locks_prefix = locks_prefix
+        self.lock_names = ["{}{}".format(locks_prefix, i)
+                           for i in range(locks_pool_size)]
+        self.watch = timeutils.StopWatch(duration=timeout)
+        self.locks_pool_size = locks_pool_size
+
+    def __enter__(self):
+        if self.coordinator:
+            LOG.debug("Trying to acquire lock for %s", self.locks_prefix)
+            self.watch.start()
+            locked = False
+            # NOTE(pas-ha) itertools.cycle essentialy keeps 2 copies of the
+            # provided iterable, but the number of allowed connections is
+            # usually small (~10) so memory penalty should be negligible
+            for name in itertools.cycle(self.lock_names):
+                lock = self.coordinator.get_lock(name)
+                try:
+                    locked = lock.acquire(blocking=False)
+                except coordination.LockAcquireFailed:
+                    locked = False
+                if locked or self.watch.expired():
+                    break
+                else:
+                    time.sleep(random.random())
+                    LOG.debug("Failed to acquire lock %s", name)
+            if not locked:
+                msg = ("Failed to acquire any of %s locks for %s"
+                       "for a netmiko action in %s seconds" % (
+                           self.locks_pool_size, self.locks_prefix,
+                           self.watch.elapsed))
+                LOG.error(msg)
+                raise coordination.LockAcquireFailed(msg)
+            self.watch.stop()
+            LOG.debug("Acquired lock %s", name)
+            self.lock = lock
+        else:
+            self.lock = False
+            return self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.coordinator and self.lock:
+            self.lock.release()
 
 
 class NetmikoSwitch(devices.GenericSwitchDevice):
@@ -45,6 +127,11 @@ class NetmikoSwitch(devices.GenericSwitchDevice):
                 device_type=device_type)
         self.config['device_type'] = device_type
 
+        self.locker = get_coordinator()
+        self.max_sessions = int(self.config.pop('ngs_netmiko_max_sessions', 1))
+        self.lock_name = self.config.get(
+            'host', '') or self.config.get('ip', '')
+
     def _format_commands(self, commands, **kwargs):
         if not commands:
             return
@@ -63,17 +150,22 @@ class NetmikoSwitch(devices.GenericSwitchDevice):
             LOG.debug("Nothing to execute")
             return
 
-        try:
-            with netmiko.ConnectHandler(**self.config) as net_connect:
-                net_connect.enable()
-                output = net_connect.send_config_set(config_commands=cmd_set)
-                # NOTE (vsaienko) always save configuration when configuration
-                # is applied successfully.
-                if self.SAVE_CONFIGURATION:
-                    net_connect.send_command(self.SAVE_CONFIGURATION)
-        except Exception as e:
-            raise exc.GenericSwitchNetmikoConnectError(config=self.config,
-                                                       error=e)
+        with NetmikoLock(self.locker, locks_pool_size=self.max_sessions,
+                         locks_prefix=self.lock_name,
+                         timeout=CONF.ngs_coordination.acquire_timeout):
+            try:
+                with netmiko.ConnectHandler(**self.config) as net_connect:
+                    net_connect.enable()
+                    output = net_connect.send_config_set(
+                        config_commands=cmd_set)
+                    # NOTE (vsaienko) always save configuration when
+                    # configuration is applied successfully.
+                    if self.SAVE_CONFIGURATION:
+                        net_connect.send_command(self.SAVE_CONFIGURATION)
+            except Exception as e:
+                raise exc.GenericSwitchNetmikoConnectError(config=self.config,
+                                                           error=e)
+
         LOG.debug(output)
 
     def add_network(self, segmentation_id, network_id):
