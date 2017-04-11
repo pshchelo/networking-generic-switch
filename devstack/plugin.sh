@@ -6,20 +6,70 @@ GENERIC_SWITCH_INI_FILE='/etc/neutron/plugins/ml2/ml2_conf_genericswitch.ini'
 GENERIC_SWITCH_SSH_KEY_FILENAME="networking-generic-switch"
 GENERIC_SWITCH_SSH_PORT=${GENERIC_SWITCH_SSH_PORT:-}
 GENERIC_SWITCH_DATA_DIR=""$DATA_DIR/networking-generic-switch""
+GENERIC_SWITCH_SSH_USER=${GENERIC_SWITCH_SSH_USER:-ngs_ovs_manager}
+GENERIC_SWITCH_SSH_USER_HOME=${GENERIC_SWITCH_SSH_USER_HOME:-$GENERIC_SWITCH_DATA_DIR/$GENERIC_SWITCH_SSH_USER}
 GENERIC_SWITCH_KEY_DIR="$GENERIC_SWITCH_DATA_DIR/keys"
 GENERIC_SWITCH_KEY_FILE=${GENERIC_SWITCH_KEY_FILE:-"$GENERIC_SWITCH_KEY_DIR/$GENERIC_SWITCH_SSH_KEY_FILENAME"}
-GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE="$HOME/.ssh/authorized_keys"
+GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE="$GENERIC_SWITCH_SSH_USER_HOME/.ssh/authorized_keys"
 GENERIC_SWITCH_TEST_BRIDGE="genericswitch"
 GENERIC_SWITCH_TEST_PORT="gs_port_01"
+# 0 means unlimited
+GENERIC_SWITCH_SSH_USER_MAX_SESSIONS=${GENERIC_SWITCH_SSH_USER_MAX_SESSIONS:-0}
 
 function install_generic_switch {
     setup_develop $GENERIC_SWITCH_DIR
 }
 
+# NOTE(pas-ha) almost verbatim copy of devstack/tools/create-stack-user.sh
+function create_ovs_manager_user {
+
+    # Give the non-root user the ability to run as **root** via ``sudo``
+    is_package_installed sudo || install_package sudo
+
+    if ! getent group $GENERIC_SWITCH_SSH_USER >/dev/null; then
+        echo "Creating a group called $GENERIC_SWITCH_SSH_USER"
+        groupadd $GENERIC_SWITCH_SSH_USER
+    fi
+
+    if ! getent passwd $GENERIC_SWITCH_SSH_USER >/dev/null; then
+        echo "Creating a user called $GENERIC_SWITCH_SSH_USER"
+        useradd -g $GENERIC_SWITCH_SSH_USER -s /bin/bash -d $GENERIC_SWITCH_SSH_USER_HOME -m $GENERIC_SWITCH_SSH_USER
+    fi
+
+    echo "Giving $GENERIC_SWITCH_SSH_USER user passwordless sudo privileges"
+    # UEC images ``/etc/sudoers`` does not have a ``#includedir``, add one
+    grep -q "^#includedir.*/etc/sudoers.d" /etc/sudoers ||
+        echo "#includedir /etc/sudoers.d" >> /etc/sudoers
+    ( umask 226 && echo "$GENERIC_SWITCH_SSH_USER_HOME ALL=(ALL) NOPASSWD:ALL"  > /etc/sudoers.d/99_ngs_ovs_manager )
+
+}
+
+function configure_for_dlm {
+    local tooz_backend
+    local neutron_db
+    local db_address
+    # limit number of ssh connections for ovs manager user
+    ( umask 226 && echo "$GENERIC_SWITCH_SSH_USER hard maxlogins $GENERIC_SWITCH_SSH_USER_MAX_SESSIONS"  > /etc/security/limits.d/ngs_ovs_manager.conf )
+    # set lock acquire timeout
+    populate_ml2_config $GENERIC_SWITCH_INI_FILE ngs_coordination acquire_timeout=120
+    # parse neutron db url
+    neutron_db=$(database_connection_url neutron)
+    db_address=$(echo $neutron_db | cut -d: -f2-)
+    if [[ "$neutron_db" =~ "mysql" ]]; then
+        tooz_backend="mysql:$db_address"
+    elif [[ "$neutron_db" =~ "postgresql" ]]; then
+        tooz_backend="postgresql:$db_address"
+    else
+        die $LINENO "devstack plugin for networking-generic-switch only supports setting DLM over MySQL or PostreSQL, neither found as DB backend for Neutron"
+    fi
+    # set dlm backend url
+    populate_ml2_config $GENERIC_SWITCH_INI_FILE ngs_coordination backend_url=$tooz_backend
+}
+
 function configure_generic_switch_ssh_keypair {
-    if [[ ! -d $HOME/.ssh ]]; then
-        mkdir -p $HOME/.ssh
-        chmod 700 $HOME/.ssh
+    if [[ ! -d $GENERIC_SWITCH_SSH_USER_HOME/.ssh ]]; then
+        mkdir -p $GENERIC_SWITCH_SSH_USER_HOME/.ssh
+        chmod 700 $GENERIC_SWITCH_SSH_USER_HOME/.ssh
     fi
     if [[ ! -e $GENERIC_SWITCH_KEY_FILE ]]; then
         if [[ ! -d $(dirname $GENERIC_SWITCH_KEY_FILE) ]]; then
@@ -34,6 +84,16 @@ function configure_generic_switch_ssh_keypair {
     cat $GENERIC_SWITCH_KEY_FILE.pub | tee -a $GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE
     # remove duplicate keys.
     sort -u -o $GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE $GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE
+    chown $GENERIC_SWITCH_SSH_USER:$GENERIC_SWITCH_SSH_USER $GENERIC_SWITCH_KEY_AUTHORIZED_KEYS_FILE 
+}
+
+function configure_generic_switch_user {
+    create_ovs_manager_user
+    configure_generic_switch_ssh_keypair
+    if [[ "$GENERIC_SWITCH_SSH_USER_MAX_SESSIONS" -gt 0 ]]; then
+        configure_for_dlm
+    fi
+
 }
 
 function configure_generic_switch {
@@ -47,7 +107,7 @@ function configure_generic_switch {
     populate_ml2_config /$Q_PLUGIN_CONF_FILE ml2 mechanism_drivers=$Q_ML2_PLUGIN_MECHANISM_DRIVERS
 
     # Generate SSH keypair
-    configure_generic_switch_ssh_keypair
+    configure_generic_switch_user
 
     sudo ovs-vsctl --may-exist add-br $GENERIC_SWITCH_TEST_BRIDGE
     ip link show gs_port_01 || sudo ip link add gs_port_01 type dummy
@@ -58,7 +118,7 @@ function configure_generic_switch {
         local bridge_mac
         bridge_mac=$(ip link show dev $switch | egrep -o "ether [A-Za-z0-9:]+"|sed "s/ether\ //")
         switch="genericswitch:$switch"
-        add_generic_switch_to_ml2_config $switch $GENERIC_SWITCH_KEY_FILE $STACK_USER localhost netmiko_ovs_linux "$GENERIC_SWITCH_SSH_PORT" "$bridge_mac"
+        add_generic_switch_to_ml2_config $switch $GENERIC_SWITCH_KEY_FILE $GENERIC_SWITCH_SSH_USER localhost netmiko_ovs_linux "$GENERIC_SWITCH_SSH_PORT" "$bridge_mac"
     done
     echo "HOST_TOPOLOGY: $HOST_TOPOLOGY"
     echo "HOST_TOPOLOGY_SUBNODES: $HOST_TOPOLOGY_SUBNODES"
@@ -70,7 +130,7 @@ function configure_generic_switch {
         for node in $HOST_TOPOLOGY_SUBNODES; do
             cnt=$((cnt+1))
             section="genericswitch:sub${cnt}${IRONIC_VM_NETWORK_BRIDGE}"
-            add_generic_switch_to_ml2_config $section $GENERIC_SWITCH_KEY_FILE $STACK_USER $node netmiko_ovs_linux "$GENERIC_SWITCH_SSH_PORT"
+            add_generic_switch_to_ml2_config $section $GENERIC_SWITCH_KEY_FILE $GENERIC_SWITCH_SSH_USER $node netmiko_ovs_linux "$GENERIC_SWITCH_SSH_PORT"
         done
     fi
 
@@ -97,6 +157,10 @@ function add_generic_switch_to_ml2_config {
     if [[ -n $ngs_mac_address ]]; then
         populate_ml2_config $GENERIC_SWITCH_INI_FILE $switch_name ngs_mac_address=$ngs_mac_address
     fi
+
+    if [[ "$device_type" =~ "netmiko" && "$GENERIC_SWITCH_SSH_USER_MAX_SESSIONS" -gt 0 ]]; then
+        populate_ml2_config $GENERIC_SWITCH_INI_FILE $switch_name ngs_netmiko_max_sessions=$GENERIC_SWITCH_SSH_USER_MAX_SESSIONS
+    fi
 }
 
 function cleanup_networking_generic_switch {
@@ -109,6 +173,12 @@ function cleanup_networking_generic_switch {
         chmod 0600 $IRONIC_AUTHORIZED_KEYS_FILE
     fi
     sudo ovs-vsctl --if-exists del-br $GENERIC_SWITCH_TEST_BRIDGE
+
+    # remove generic switch user, its permissions and limits
+    rm -f /etc/sudoers.d/99_ngs_ovs_manager
+    rm -f /etc/security/limits.d/ngs_ovs_manager.conf
+    deluser $GENERIC_SWITCH_SSH_USER --remove-home --quiet
+    delgroup $GENERIC_SWITCH_SSH_USER --quiet
 
     rm -rf $GENERIC_SWITCH_DATA_DIR
 }
